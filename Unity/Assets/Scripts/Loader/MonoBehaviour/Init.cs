@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Threading.Tasks;
 using CommandLine;
 using UnityEngine;
 
 namespace ET
 {
+	// 使用 await 的调用示例
+
 	public class Init: MonoBehaviour
 	{
 		private void Start()

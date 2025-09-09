@@ -959,7 +959,7 @@ namespace ET
 
                     entity.BeginInit();
                 }
-            }
+            } 
 
             this.childrenDB?.Clear();
             if (this.children != null && this.children.Count != 0)

@@ -14,8 +14,27 @@ using MongoDB.Bson.Serialization.Attributes;
 using OfficeOpenXml;
 using LicenseContext = OfficeOpenXml.LicenseContext;
 
+/*
+ Excel 导出工具说明（简要）
+ - 用途：从 Excel 表生成配置类（c/s/cs），导出对应 JSON，再合并为二进制（BSON）bytes。
+ - Excel 命名：文件名可带 @cs/@c/@s 指定导出目标，缺省等同于 cs；同一 proto 可拆分多个文件，以下划线后缀区分，protoName 取最后一个下划线之前部分。
+ - 表头规范：
+   第2行：字段 CS 标记（c/s/cs 或含 # 表示忽略该列）
+   第3行：字段注释
+   第4行：字段名
+   第5行：字段类型
+   第6行起：数据行；第2列为行 CS 前缀（c/s/cs，空视为 cs，含 # 跳过），第3列为 Id。
+ - 输出：
+   类文件：Client/Server/ClientServer 三处；
+   JSON：Config/Json/{c|s|cs}/{相对路径}/xxx.txt；
+   bytes：Config/Excel/{c|s|cs}/{相对路径}/{ProtoName}Category.bytes；并将 c 目录复制到 Unity/Assets/Bundles/Config。
+*/
+
 namespace ET
 {
+    /// <summary>
+    /// 配置导出目标：c=客户端，s=服务端，cs=客户端与服务端
+    /// </summary>
     public enum ConfigType
     {
         c = 0,
@@ -23,6 +42,9 @@ namespace ET
         cs = 2,
     }
 
+    /// <summary>
+    /// 表头信息（按列汇总）：包含 CS 标记、注释、字段名、类型及顺序索引
+    /// </summary>
     class HeadInfo
     {
         [BsonElement]
@@ -43,29 +65,42 @@ namespace ET
     }
 
     // 这里加个标签是为了防止编译时裁剪掉protobuf，因为整个tool工程没有用到protobuf，编译会去掉引用，然后动态编译就会出错
+    /// <summary>
+    /// 同一 proto 聚合的表信息（跨工作表/跨文件合并字段定义）
+    /// </summary>
     class Table
     {
-        public bool C;
-        public bool S;
+        public bool C;   // 是否包含客户端导出
+        public bool S;   // 是否包含服务端导出
         public int Index;
         public Dictionary<string, HeadInfo> HeadInfos = new Dictionary<string, HeadInfo>();
     }
     
+    /// <summary>
+    /// Excel 导出器：生成类文件 -> 动态编译 -> 导出 JSON -> 合并生成 BSON bytes
+    /// </summary>
     public static class ExcelExporter
     {
         private static string template;
 
+        // 生成类（客户端）输出目录
         private const string ClientClassDir = "../Unity/Assets/Scripts/Model/Generate/Client/Config";
         // 服务端因为机器人的存在必须包含客户端所有配置，所以单独的c字段没有意义,单独的c就表示cs
+        // 生成类（服务端）输出目录
         private const string ServerClassDir = "../Unity/Assets/Scripts/Model/Generate/Server/Config";
 
+        // 生成类（客户端+服务端）输出目录
         private const string CSClassDir = "../Unity/Assets/Scripts/Model/Generate/ClientServer/Config";
 
+        // Excel 源目录
         private const string excelDir = "../Unity/Assets/Config/Excel/";
 
+        // JSON 输出目录格式：Config/Json/{c|s|cs}/{相对路径}
         private const string jsonDir = "../Config/Json/{0}/{1}";
 
+        // bytes（客户端）最终复制到 Bundles/Config
         private const string clientProtoDir = "../Unity/Assets/Bundles/Config";
+        // bytes（服务端/通用）原始输出目录格式：Config/Excel/{c|s|cs}/{相对路径}
         private const string serverProtoDir = "../Config/Excel/{0}/{1}";
         private const string replaceStr = "/{0}/{1}";
         private static Assembly[] configAssemblies = new Assembly[3];
@@ -73,6 +108,9 @@ namespace ET
         private static Dictionary<string, Table> tables = new Dictionary<string, Table>();
         private static Dictionary<string, ExcelPackage> packages = new Dictionary<string, ExcelPackage>();
 
+        /// <summary>
+        /// 获取（或创建）同名 proto 的聚合表信息
+        /// </summary>
         private static Table GetTable(string protoName)
         {
             if (!tables.TryGetValue(protoName, out var table))
@@ -84,6 +122,9 @@ namespace ET
             return table;
         }
 
+        /// <summary>
+        /// 打开并缓存 ExcelPackage（支持并行读）
+        /// </summary>
         public static ExcelPackage GetPackage(string filePath)
         {
             if (!packages.TryGetValue(filePath, out var package))
@@ -96,6 +137,10 @@ namespace ET
             return package;
         }
 
+        /// <summary>
+        /// 导出主流程：清理输出 -> 扫描 Excel 生成类 -> 动态编译 -> 导出 JSON/bytes -> 复制客户端资源
+        /// Excel 文件名规则：ProtoName[@cs|@c|@s][_{分片}].xlsx；不写 @ 时等同 cs
+        /// </summary>
         public static void Export()
         {
             try
@@ -103,6 +148,7 @@ namespace ET
                 template = File.ReadAllText("Template.txt");
                 ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
 
+                // 清理类输出目录
                 if (Directory.Exists(ClientClassDir))
                 {
                     Directory.Delete(ClientClassDir, true);
@@ -118,6 +164,7 @@ namespace ET
                     Directory.Delete(CSClassDir, true);
                 }
 
+                // 清理 JSON 与 bytes 输出目录
                 string jsonProtoDirParent = jsonDir.Replace(replaceStr, string.Empty);
                 if (Directory.Exists(jsonProtoDirParent))
                 {
@@ -130,18 +177,19 @@ namespace ET
                     Directory.Delete(serverProtoDirParent, true);
                 }
 
+                // 收集类定义（跨文件/工作表合并）
                 List<string> files = FileHelper.GetAllFiles(excelDir);
                 foreach (string path in files)
                 {
                     string fileName = Path.GetFileName(path);
                     if (!fileName.EndsWith(".xlsx") || fileName.StartsWith("~$") || fileName.Contains("#"))
                     {
-                        continue;
+                        continue; // 临时文件或标记文件跳过
                     }
 
                     string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(fileName);
                     string fileNameWithoutCS = fileNameWithoutExtension;
-                    string cs = "cs";
+                    string cs = "cs"; // 默认导出到 cs
                     if (fileNameWithoutExtension.Contains("@"))
                     {
                         string[] ss = fileNameWithoutExtension.Split("@");
@@ -156,6 +204,7 @@ namespace ET
 
                     ExcelPackage p = GetPackage(Path.GetFullPath(path));
 
+                    // 支持同一 proto 拆分：取最后一个下划线之前部分作为 protoName
                     string protoName = fileNameWithoutCS;
                     if (fileNameWithoutCS.Contains('_'))
                     {
@@ -177,6 +226,7 @@ namespace ET
                     ExportExcelClass(p, protoName, table);
                 }
 
+                // 按 c/s/cs 维度导出类文件
                 foreach (var kv in tables)
                 {
                     if (kv.Value.C)
@@ -195,6 +245,7 @@ namespace ET
                 configAssemblies[(int) ConfigType.s] = DynamicBuild(ConfigType.s);
                 configAssemblies[(int) ConfigType.cs] = DynamicBuild(ConfigType.cs);
 
+                // 导出 JSON 与 bytes
                 List<string> excels = FileHelper.GetAllFiles(excelDir, "*.xlsx");
                 
                 foreach (string path in excels)
@@ -202,6 +253,7 @@ namespace ET
                     ExportExcel(path);
                 }
                 
+                // 将客户端 bytes 统一复制到 Bundles/Config
                 if (Directory.Exists(clientProtoDir))
                 {
                     Directory.Delete(clientProtoDir, true);
@@ -226,6 +278,9 @@ namespace ET
             }
         }
 
+        /// <summary>
+        /// 导出单个 Excel：按 c/s/cs 过滤导出 JSON 与 bytes
+        /// </summary>
         private static void ExportExcel(string path)
         {
             string dir = Path.GetDirectoryName(path);
@@ -297,6 +352,9 @@ namespace ET
         }
         
         // 动态编译生成的cs代码
+        /// <summary>
+        /// 动态编译指定目标（c/s/cs）的已生成类，供 JSON 反序列化与合并使用
+        /// </summary>
         private static Assembly DynamicBuild(ConfigType configType)
         {
             string classPath = GetClassDir(configType);
@@ -362,6 +420,9 @@ namespace ET
 
         #region 导出class
 
+        /// <summary>
+        /// 遍历所有工作表并收集表头定义
+        /// </summary>
         static void ExportExcelClass(ExcelPackage p, string name, Table table)
         {
             foreach (ExcelWorksheet worksheet in p.Workbook.Worksheets)
@@ -370,6 +431,11 @@ namespace ET
             }
         }
 
+        /// <summary>
+        /// 解析工作表表头定义：
+        /// 第2行=CS 标记；第3行=注释；第4行=字段名；第5行=类型；第3列起为有效字段列
+        /// 列 CS 含 # 表示废弃该列（不导出）
+        /// </summary>
         static void ExportSheetClass(ExcelWorksheet worksheet, Table table)
         {
             const int row = 2;
@@ -394,13 +460,13 @@ namespace ET
                 string fieldCS = worksheet.Cells[row, col].Text.Trim().ToLower();
                 if (fieldCS.Contains("#"))
                 {
-                    table.HeadInfos[fieldName] = null;
+                    table.HeadInfos[fieldName] = null; // 显式忽略该列
                     continue;
                 }
                 
                 if (fieldCS == "")
                 {
-                    fieldCS = "cs";
+                    fieldCS = "cs"; // 缺省视为 cs
                 }
 
                 if (table.HeadInfos.TryGetValue(fieldName, out var oldClassField))
@@ -420,6 +486,9 @@ namespace ET
             }
         }
 
+        /// <summary>
+        /// 根据收集的表头生成类文件，按导出目标（c/s/cs）过滤字段
+        /// </summary>
         static void ExportClass(string protoName, Dictionary<string, HeadInfo> classField, ConfigType configType)
         {
             string dir = GetClassDir(configType);
@@ -460,6 +529,9 @@ namespace ET
         #region 导出json
 
 
+        /// <summary>
+        /// 导出整个 Excel 的 JSON（dict 数组形式），每个工作表依次追加
+        /// </summary>
         static void ExportExcelJson(ExcelPackage p, string name, Table table, ConfigType configType, string relativeDir)
         {
             StringBuilder sb = new StringBuilder();
@@ -488,6 +560,12 @@ namespace ET
             sw.Write(sb.ToString());
         }
 
+        /// <summary>
+        /// 导出单个工作表的数据：
+        /// - 数据从第6行开始；第2列为行 CS 前缀（含 # 跳过，空视为 cs）
+        /// - 第3列为 Id（必须）；字段从第3列起；字段名取第4行
+        /// - 字段名为 Id 时导出为 _id
+        /// </summary>
         static void ExportSheetJson(ExcelWorksheet worksheet, string name, 
                 Dictionary<string, HeadInfo> classField, ConfigType configType, StringBuilder sb)
         {
@@ -512,7 +590,7 @@ namespace ET
 
                 if (worksheet.Cells[row, 3].Text.Trim() == "")
                 {
-                    continue;
+                    continue; // 无 Id 的行不导出
                 }
 
                 sb.Append($"[{worksheet.Cells[row, 3].Text.Trim()}, {{\"_t\":\"{name}\"");
@@ -549,6 +627,9 @@ namespace ET
             }
         }
 
+        /// <summary>
+        /// 类型转换与格式化：数组原样包裹，数字空值为0，字符串做转义并加引号
+        /// </summary>
         private static string Convert(string type, string value)
         {
             switch (type)
@@ -587,6 +668,9 @@ namespace ET
 
 
         // 根据生成的类，把json转成protobuf
+        /// <summary>
+        /// 合并同名 JSON（支持多分片，按文件名倒序）并序列化为 BSON bytes：{ProtoName}Category.bytes
+        /// </summary>
         private static void ExportExcelProtobuf(ConfigType configType, string protoName, string relativeDir)
         {
             string dir = GetProtoDir(configType, relativeDir);

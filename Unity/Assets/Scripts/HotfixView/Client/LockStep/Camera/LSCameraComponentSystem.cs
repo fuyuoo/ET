@@ -16,6 +16,7 @@ namespace ET.Client
 		[EntitySystem]
 		private static void LateUpdate(this LSCameraComponent self)
 		{
+			// Debug.LogError($"{333}");
 			// 摄像机每帧更新位置
 			Room room = self.GetParent<Room>();
 			if (room.IsReplay)
